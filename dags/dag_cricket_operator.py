@@ -20,8 +20,8 @@ headers = {
 }
 
 
-now = datetime.now(tz=ZoneInfo('Asia/Kolkata'))
-print("Current date and time in Asia/Kolkata:", now)
+ist = datetime.now(tz=ZoneInfo('Asia/Kolkata'))
+print("Current date and time in Asia/Kolkata:", ist)
 
 
 def upload_csv_to_gcs(local_path,tg_gcp_path,bucket_name):
@@ -36,7 +36,7 @@ def upload_csv_to_gcs(local_path,tg_gcp_path,bucket_name):
         return True
     except Exception as e:
         logging.error(f"❌ Failed to upload CSV to GCS: {e}")
-        return False
+        raise Exception(f'⚠️Exception:{e}')
 
 
 def load_gcs_to_bigquery(gcp_path,project_id, dataset_id, table_name):
@@ -62,24 +62,38 @@ def load_gcs_to_bigquery(gcp_path,project_id, dataset_id, table_name):
         logging.info(f"✅ Loaded rows into {table_id}")
     except Exception as e:
         logging.error(f"❌ Error loading data into BigQuery: {e}")
-    return None
+        raise Exception(f'⚠️Exception:{e}')
 
 
-def run_bq_query(query=None):
+def run_bq_query(query=None, params=None):
     bq_client = bigquery.Client(project=project_id)
-    
     try:
-        query_job = bq_client.query(query)
+        if params:
+            query_job = bq_client.query(query, job_config=bigquery.QueryJobConfig(query_parameters=params))
+        else:
+            query_job = bq_client.query(query)
         results = query_job.result()  # Wait for the job to complete
         return results
     except Exception as e:
         logging.error(f"❌ Error running BigQuery query: {e}")
-        return None
+        raise Exception(f'⚠️Exception:{e}')
+    
+def run_bq_sp(dataset_id, sp_name):
+    bq_client = bigquery.Client(project=project_id)
+    query = f"CALL `{project_id}.{dataset_id}.{sp_name}`()"
+    try:
+        query_job = bq_client.query(query)
+        results = query_job.result()  # Wait for the job to complete
+        affected_rows = query_job.num_dml_affected_rows
+        logging.info(f"✅ Stored procedure {project_id}.{dataset_id}.{sp_name} executed, affected rows: {affected_rows}")
+    except Exception as e:
+        logging.error(f"❌ Error running BigQuery stored procedure: {e}")
+        raise Exception(f'⚠️Exception:{e}')
 
 
 
 def icc_ranking(**kwargs):
-    now = datetime.now(tz=ZoneInfo('Asia/Kolkata'))
+    now = datetime.now()
     category = kwargs["category"]
     csv_folder = kwargs.get("csv_folder", "icc_ranking_files")  # Use provided csv_folder or default
     format_types = ["test", "odi", "t20"]
@@ -90,7 +104,7 @@ def icc_ranking(**kwargs):
     local_path = f"/tmp/{csv_filename}"
     gcp_path = f"{csv_folder}/{csv_filename}"
 
-    field_names = ["match_format","ranking","name","player_id","country","rating","points","lastUpdatedOn","insert_timestamp"]
+    field_names = ["match_format","ranking","player_name","player_id","country","rating","points","lastUpdatedOn","insert_timestamp"]
 
     all_rows = []
 
@@ -99,9 +113,9 @@ def icc_ranking(**kwargs):
         try:
             response = requests.get(url, headers=headers, params=params, timeout=10)
             if response.status_code != 200:
-                logging.error(f"❌ Failed for {match_format} with status code {response.status_code}. Stopping downstream tasks.")
-                return None  # Stop downstream processing
-            logging.info(f"Successful for {match_format}")
+                logging.error(f"❌ API call failed for match_format: {match_format} with status code {response.status_code}.")
+                raise Exception(f'⚠️Exception:{e}')
+            logging.info(f"✅ API call successful for match_format: {match_format}")
             json_data = response.json()
             data = json_data.get("rank", [])
             for entry in data:
@@ -117,22 +131,26 @@ def icc_ranking(**kwargs):
                     "insert_timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
                 })
         except Exception as e:
-            logging.error(f"❌ Exception occurred for {match_format}: {e}. Stopping downstream tasks.")
-            return None  # Stop downstream processing
+            logging.error(f"❌ Exception occurred for {match_format}: {e}.")
+            raise Exception(f'⚠️Exception:{e}')
 
     # Write once
-    if all_rows:
-        with open(local_path, "w", newline="", encoding="utf-8") as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=field_names)
-            writer.writeheader()
-            writer.writerows(all_rows)
-        status_upload_csv_to_gcs = upload_csv_to_gcs(local_path, gcp_path, bucket_name)  # Upload to GCS
-        logging.info(f"✅ Data written to {csv_filename}")
-        if status_upload_csv_to_gcs:
+    try:
+        if all_rows:
+            with open(local_path, "w", newline="", encoding="utf-8") as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=field_names)
+                writer.writeheader()
+                writer.writerows(all_rows)
+            status_upload_csv_to_gcs = upload_csv_to_gcs(local_path, gcp_path, bucket_name)  # Upload to GCS
+            logging.info(f"✅ Data written to {csv_filename}")
+            if status_upload_csv_to_gcs:
                 load_gcs_to_bigquery(gcp_path,project_id, icc_ranking_dataset_id, f"{category}_ranking_stg") # Load to BigQuery
-    else:
-        logging.warning("⚠️ No data received")
-    return None
+        else:
+            logging.error("No data received.")
+            raise Exception("❌ No data received.")
+    except Exception as e:
+        logging.error(f"❌ Exception in writing/loading rankings data: {e}")
+        raise Exception(f'⚠️Exception:{e}')
 
 
 def push_to_xcom(ti, key, value):
@@ -142,7 +160,7 @@ def push_to_xcom(ti, key, value):
         logging.info(f"✅ Pushed {key} to XCom")
     except Exception as e:
         logging.error(f"❌ Failed to push {key} to XCom: {e}")
-        raise
+        raise Exception(f'⚠️Exception:{e}')
 
 def fetch_stats(ti, **kwargs):
     """Fetch stats for all players and load to BigQuery."""
@@ -150,7 +168,7 @@ def fetch_stats(ti, **kwargs):
     try:
         player_ids = ti.xcom_pull(key="player_ids")
         if not player_ids:
-            raise ValueError("No player IDs received from XCom")
+            raise Exception("❌ No player IDs received from XCom")
 
         all_data = []
         for player_id in player_ids:
@@ -164,11 +182,12 @@ def fetch_stats(ti, **kwargs):
                     data = response.json()
                 except (json.JSONDecodeError, ValueError) as je:
                     logging.error(f"❌ JSON decode error for player_id {player_id}: {je}")
-                    continue
+                    raise Exception(je)
+                    
 
                 if "values" not in data or "headers" not in data:
-                    logging.warning(f"No valid data for player {player_id}, stat_type {stat_type}")
-                    continue
+                    logging.warning(f"❌ No valid data for player {player_id}, stat_type {stat_type}")
+                    raise Exception("Missing 'values' or 'headers' in response")
 
                 df = pd.DataFrame(
                     [row["values"] for row in data["values"]],
@@ -183,13 +202,15 @@ def fetch_stats(ti, **kwargs):
                 )
                 dft.insert(0, "player_id", player_id)
                 dft.insert(1, "stat_type", stat_type)
-                dft["insert_timestamp"] = datetime.now(tz=ZoneInfo('Asia/Kolkata')).strftime("%Y-%m-%d %H:%M:%S")
+                dft["insert_timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 all_data.append(dft)
 
             except requests.exceptions.RequestException as re:
                 logging.error(f"❌ HTTP error for player_id {player_id}: {re}")
+                raise Exception(f'⚠️Exception:{re}')
             except Exception as e:
                 logging.error(f"❌ Error processing player_id {player_id}: {e}")
+                raise Exception(f'⚠️Exception:{e}')
 
         if all_data:
             final_df = pd.concat(all_data, ignore_index=True)
@@ -199,7 +220,7 @@ def fetch_stats(ti, **kwargs):
 
     except Exception as e:
         logging.error(f"❌ Failed to fetch stats for stat_type {stat_type}: {e}")
-        raise
+        raise Exception(f'⚠️Exception:{e}')
 
 def load_df_to_bigquery(df, target_table):
     """Load a DataFrame to BigQuery."""
@@ -220,12 +241,17 @@ def load_df_to_bigquery(df, target_table):
         logging.info(f"✅ Loaded {len(df)} rows into {table_id}")
     except Exception as e:
         logging.error(f"❌ Error loading DataFrame into BigQuery: {e}")
-        raise
+        raise Exception(f'⚠️Exception:{e}')
 
-def fetch_player_info(player_ids, **context):
-    if not player_ids:
-        logging.info("✅ No new players to fetch")
-        return None
+def fetch_player_info(ti, **context):
+    now = datetime.now()
+    try:
+        player_ids = ti.xcom_pull(key="missing_player_ids", include_prior_dates=True)
+        if not player_ids:
+            logging.warning("No player_ids found in XCom")
+    except Exception as e:
+        logging.error(f"❌ XCom pull failed: {e}")
+        raise Exception(f'⚠️Exception:{e}')
     all_player_info = []
     for player_id in player_ids:
         url = f"https://cricbuzz-cricket.p.rapidapi.com/stats/v1/player/{player_id}"
@@ -233,7 +259,7 @@ def fetch_player_info(player_ids, **context):
             response = requests.get(url, headers=headers, timeout=30)
             if response.status_code != 200:
                 logging.error(f"❌ API failed for {player_id}: {response.text}")
-                break
+                raise Exception(f'⚠️Exception:{response.text}')
             data = response.json()
             data['DoB'] = data.get('DoB', '').split('(')[0].strip() if data.get('DoB') else None
             player_record = {
@@ -244,15 +270,16 @@ def fetch_player_info(player_ids, **context):
                 "batting_style": data.get("bat"),
                 "bowling_style": data.get("bowl"),
                 "DoB": data.get("DoB"),
-                "birthPlace": data.get("birthPlace"),
-                "insert_timestamp": datetime.now(tz=ZoneInfo('Asia/Kolkata')).strftime("%Y-%m-%d %H:%M:%S")
+                "birthPlace": data.get("birthPlace")
             }
             all_player_info.append(player_record)
         except Exception as e:
             logging.error(f"❌ Exception while fetching {player_id}: {e}")
-            continue
+            raise Exception(f'⚠️Exception:{e}')
     logging.info(f"📦 Total records fetched: {len(all_player_info)}")
 
     if all_player_info:
         df = pd.DataFrame(all_player_info)
-        load_df_to_bigquery(df, context.get('TARGET_TABLE', 'player_info'))
+        df['insert_timestamp'] = now.strftime("%Y-%m-%d %H:%M:%S")
+        logging.info(f"✅ DataFrame created with {len(df)} records")
+        load_df_to_bigquery(df,'players_info')
